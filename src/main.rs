@@ -4,10 +4,10 @@ use std::io::{Read, stdin};
 use std::env::args;
 
 // test cases
-//   read from file: cq -in <file>
-//   read from stdin by default: cq
-//   read a column: cq -select city
-//   read columns: cq -select city county
+//   .read from file: cq -in <file>
+//   .read from stdin by default: cq
+//   .read a column: cq -select city
+//   .read columns: cq -select city county
 //   read rows: cq -where state -eq WA
 //   read column(s) from a row: cq -c city county -where state -eq WA
 //   change delimiter: cq -delim "|"
@@ -52,65 +52,127 @@ struct Filter {
     value: String,
 }
 
+struct FilterState {
+    column_index: usize,
+    value: String,
+    matched: bool,
+}
+
 struct ReaderArgs {
     input: Box<dyn Read>,
     columns: Vec<String>,
     filters: Vec<Filter>,
 }
 
-fn main() -> Result<(), String> {
-    let args: Vec<String> = args().collect();
-    let mut reader_args = parse_args(Iterator::new(args))?;
-    let mut column_indexes = vec!();
-    let mut in_header = true;
-    let mut column_index = 0;
-    let mut current_value = vec!();
-    let mut buf = vec!(0, 0, 0);
-    let mut printed = false;
+struct ReaderState {
+    column_indexes: Vec<usize>,
+    filters: Vec<FilterState>,
+    in_header: bool,
+    column_index: usize,
+    current_value: Vec<u8>,
+    buf: Vec<u8>,
+    to_print: Vec<String>,
+}
 
-    let mut len = reader_args.input.read(&mut buf).unwrap();
+fn main() -> Result<(), String> {
+    let cmd_args: Vec<String> = args().collect();
+    let mut args = parse_args(Iterator::new(cmd_args))?;
+    let mut state = ReaderState {
+        column_indexes: vec!(),
+        filters: vec!(),
+        in_header: true,
+        column_index: 0,
+        current_value: vec!(),
+        buf: vec!(0, 0, 0),
+        to_print: vec!(),
+    };
+
+    let mut len = args.input.read(&mut state.buf).unwrap();
     while len > 0 {
-        len = reader_args.input.read(&mut buf).unwrap();
         for i in 0 .. len {
-            match buf[i] {
+            match state.buf[i] {
                 10 => {
                     // Truly ignore
                 }
                 13 => {
-                    in_header = false;
-                    column_index = 0;
-                    current_value = vec!();
-                    if printed {
-                        println!();
-                        printed = false;
-                    }
+                    handle_value_end(&args, &mut state);
+                    handle_line_end(&args, &mut state);
                 }
                 44 => {
-                    if in_header {
-                        let value = String::from_utf8(current_value).unwrap();
-                        if reader_args.columns.contains(&value) {
-                            column_indexes.push(column_index);
-                        }
-                    } else if column_indexes.contains(&column_index) || reader_args.columns.len() == 0 {
-                        if printed {
-                            print!(",");
-                        }
-                        let value = String::from_utf8(current_value).unwrap();
-                        print!("{}", value);
-                        printed = true;
-                    }
-
-                    column_index += 1;
-                    current_value = vec!();
+                    handle_value_end(&args, &mut state);
                 },
                 _ => {
-                    current_value.push(buf[i])
+                    state.current_value.push(state.buf[i])
                 }
+            }
+        }
+
+        len = args.input.read(&mut state.buf).unwrap();
+    }
+    handle_value_end(&args, &mut state);
+    handle_line_end(&args, &mut state);
+
+    Ok(())
+}
+
+fn handle_line_end(_args: &ReaderArgs, state: &mut ReaderState) {
+    state.in_header = false;
+    state.column_index = 0;
+    state.current_value = vec!();
+
+    if state.filters.iter().all(|f| f.matched) {
+        if state.to_print.len() > 0 {
+            let mut first = true;
+            for value in state.to_print.iter() {
+                if !first {
+                    print!(",");
+                }
+                first = false;
+                print!("{}", value);
+            }
+
+            state.to_print.clear();
+            println!();
+        }
+    }
+
+    for filter in state.filters.iter_mut() {
+        filter.matched = false;
+    }
+}
+
+fn handle_value_end(args: &ReaderArgs, state: &mut ReaderState) {
+    if state.in_header {
+        let value = std::str::from_utf8(state.current_value.as_slice()).unwrap();
+        if args.columns.contains(&value.to_string()) {
+            state.column_indexes.push(state.column_index);
+        }
+        if let Some(filter) = args.filters.iter().find(|f| &f.column == value) {
+            state.filters.push(FilterState {
+                column_index: state.column_index,
+                value: filter.value.to_string(),
+                matched: false,
+            });
+        }
+    } else {
+        if state.column_indexes.contains(&state.column_index) || args.columns.len() == 0 {
+            let value = String::from_utf8(state.current_value.clone()).unwrap();
+            state.to_print.push(value);
+        }
+
+        let column_index = state.column_index.clone();
+        let filter_maybe =
+            state.filters.iter_mut().find(|f| f.column_index == column_index);
+        if let Some(filter) = filter_maybe {
+            let value = String::from_utf8(state.current_value.clone()).unwrap();
+            if value == filter.value {
+                filter.matched = true;
             }
         }
     }
 
-    Ok(())
+    state.column_index += 1;
+    state.current_value = vec!();
 }
 
 fn parse_args(mut args: Iterator<String>) -> Result<ReaderArgs, String> {
@@ -124,8 +186,8 @@ fn parse_args(mut args: Iterator<String>) -> Result<ReaderArgs, String> {
 
     while let Some(arg) = args.accept() {
         match arg.as_str() {
-            "-input" => {
-                let filename = args.expect("Expected filename after -input".to_string())?;
+            "-in" => {
+                let filename = args.expect("Expected filename after -in".to_string())?;
                 let path = Path::new(filename);
                 result.input = Box::new(File::open(&path).unwrap());
             },
